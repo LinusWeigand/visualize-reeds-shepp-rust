@@ -88,12 +88,13 @@ impl State {
     }
 
     fn reset(&mut self) {
+        println!("State reset."); // Print *before* overwriting
         let default_mode = DisplayMode::ShortestPath;
         let default_combo_index = 0;
         *self = State::new();
         self.display_mode = default_mode;
         self.combo_box_selected_index = default_combo_index;
-        println!("State reset.");
+        // No need to print again here
     }
 
     fn set_display_mode_from_index(&mut self, index: usize) {
@@ -120,7 +121,7 @@ impl State {
     }
 
     fn calculate_initial_drag_angle(&self) -> Option<f64> {
-        if let Some(drag)=&self.drag_state_initial{let d=drag.current_pos-drag.start_pos;if d.length_squared()>5.0*5.0{let a = d.y.atan2(d.x); return Some((-a).to_degrees() as f64);}} None
+        if let Some(drag)=&self.drag_state_initial{let d=drag.current_pos-drag.start_pos;if d.length_squared()>5.0*5.0{let a=d.y.atan2(d.x);return Some((-a).to_degrees() as f64);}}None
     }
 
      fn check_body_hit(&self, world_click_pos: (f64, f64), pose: &Pose) -> bool {
@@ -143,60 +144,44 @@ impl State {
             match self.display_mode {
                 DisplayMode::SinglePath(index) => {
                     let relative_pose = utils::change_of_basis(start, end);
-                    let mut x = relative_pose.x; let mut y = relative_pose.y;
-                    let mut theta_degree = relative_pose.theta_degree;
-                    let needs_reflect_calc = self.reflect_path;
-                    let needs_timeflip_calc = self.timeflip_path;
-                    if needs_reflect_calc { y = -y; theta_degree = -theta_degree; }
-                    if needs_timeflip_calc { x = -x; theta_degree = if needs_reflect_calc { theta_degree } else { -theta_degree }; }
-
+                    let mut x=relative_pose.x; let mut y=relative_pose.y; let mut theta_degree=relative_pose.theta_degree;
+                    let reflect=self.reflect_path; let timeflip=self.timeflip_path;
+                    if reflect { y=-y; theta_degree=-theta_degree; }
+                    if timeflip { x=-x; theta_degree = if reflect {theta_degree} else {-theta_degree}; }
                     if let Some(path_fn) = PATH_FNS.get(index) {
-                        let mut calculated_path = path_fn(x, y, theta_degree);
-                        if needs_timeflip_calc { calculated_path = timeflip(calculated_path); }
-                        if needs_reflect_calc { calculated_path = reflect(calculated_path); }
-                        if !calculated_path.is_empty() {
-                            let points = generate_path_points(start, &calculated_path, PATH_RESOLUTION);
-                            if !points.is_empty() {
-                                self.current_path_points = Some(points);
-                                self.current_raw_path = Some(calculated_path);
-                            }
+                        let mut path = path_fn(x, y, theta_degree);
+                        if timeflip { path = reeds_shepp_lib::timeflip(path); } // Use module path
+                        if reflect { path = reeds_shepp_lib::reflect(path); } // Use module path
+                        if !path.is_empty() {
+                            let points = generate_path_points(start, &path, PATH_RESOLUTION);
+                            if !points.is_empty() { self.current_path_points=Some(points); self.current_raw_path=Some(path); }
                         }
                     }
                 }
                 DisplayMode::ShortestPath => {
-                    if let Some(optimal_path) = get_optimal_path(*start, *end) {
-                         if !optimal_path.is_empty() {
-                            let points = generate_path_points(start, &optimal_path, PATH_RESOLUTION);
-                            if !points.is_empty() {
-                                self.current_path_points = Some(points);
-                                self.current_raw_path = Some(optimal_path);
-                            }
+                    if let Some(path) = get_optimal_path(*start, *end) {
+                         if !path.is_empty() {
+                            let points = generate_path_points(start, &path, PATH_RESOLUTION);
+                            if !points.is_empty() { self.current_path_points=Some(points); self.current_raw_path=Some(path); }
                          }
                     }
                 }
                 DisplayMode::AllPaths => {
-                     let all_raw_paths = get_all_paths(*start, *end);
-                     let mut shortest_path: Option<Path> = None;
-                     let mut shortest_len = f64::INFINITY;
-                     for raw_path in all_raw_paths {
-                          if raw_path.is_empty() { continue; }
-                          let points = generate_path_points(start, &raw_path, PATH_RESOLUTION);
+                     let all_raw = get_all_paths(*start, *end);
+                     let mut shortest: Option<Path> = None; let mut shortest_len = f64::INFINITY;
+                     for path in all_raw {
+                          if path.is_empty() { continue; }
+                          let points = generate_path_points(start, &path, PATH_RESOLUTION);
                           if !points.is_empty() {
                               self.all_paths_points.push(points);
-                              let len = path_length(&raw_path);
-                              if len < shortest_len {
-                                   shortest_len = len; shortest_path = Some(raw_path);
-                              }
+                              let len = path_length(&path);
+                              if len < shortest_len { shortest_len=len; shortest=Some(path); }
                           }
                      }
-                     if let Some(shortest) = shortest_path {
-                           let shortest_points = generate_path_points(start, &shortest, PATH_RESOLUTION);
-                           if !shortest_points.is_empty() {
-                                self.current_path_points = Some(shortest_points);
-                                self.current_raw_path = Some(shortest);
-                           } else if !self.all_paths_points.is_empty() {
-                                self.current_path_points = self.all_paths_points.first().cloned();
-                           }
+                     if let Some(s_path) = shortest {
+                           let s_points = generate_path_points(start, &s_path, PATH_RESOLUTION);
+                           if !s_points.is_empty() { self.current_path_points=Some(s_points); self.current_raw_path=Some(s_path); }
+                           else if !self.all_paths_points.is_empty() { self.current_path_points = self.all_paths_points.first().cloned(); }
                      }
                 }
             }
@@ -207,29 +192,28 @@ impl State {
 
 // Generate points for drawing
 fn generate_path_points(
-    start_pose: &Pose, // Added back
+    start_pose: &Pose,
     path: &Path,
     resolution: f64,
-) -> Vec<Vec2> { // Signature corrected
+) -> Vec<Vec2> {
     if path.is_empty() { return Vec::new(); }
     let mut points = Vec::new();
-    let mut current_x = start_pose.x; // Use parameter
-    let mut current_y = start_pose.y; // Use parameter
-    let mut current_theta_rad = utils::normalize_angle_rad(start_pose.theta_degree.to_radians()); // Use parameter
+    let mut current_x = start_pose.x; let mut current_y = start_pose.y;
+    let mut current_theta_rad = utils::normalize_angle_rad(start_pose.theta_degree.to_radians());
     points.push(State::world_to_screen_static(current_x, current_y));
     for element in path {
         let param = element.param; if param < 1e-10 { continue; }
-        let length_for_res = match element.steering { Steering::Straight=>param, Steering::Left|Steering::Right=>param.abs()*TURNING_RADIUS,};
-        let num_steps = ((length_for_res * resolution).ceil().max(1.0)) as usize;
-        let gear_mult = match element.gear { Gear::Forward=>1.0, Gear::Backwards=>-1.0,};
-        let mut next_x; let mut next_y; let mut next_theta;
-        for _i in 1..=num_steps {
+        let len_res = match element.steering{Steering::Straight=>param,Steering::Left|Steering::Right=>param.abs()*TURNING_RADIUS,};
+        let n_steps=((len_res*resolution).ceil().max(1.0))as usize;
+        let g_mult=match element.gear{Gear::Forward=>1.0,Gear::Backwards=>-1.0,};
+        let mut nx; let mut ny; let mut nt;
+        for _i in 1..=n_steps {
              match element.steering {
-                Steering::Straight=>{let d=param/num_steps as f64*gear_mult; next_x=current_x+d*current_theta_rad.cos(); next_y=current_y+d*current_theta_rad.sin(); next_theta=current_theta_rad;}
-                Steering::Left=>{let a=param/num_steps as f64*gear_mult; next_theta=utils::normalize_angle_rad(current_theta_rad+a); let dx=TURNING_RADIUS*(next_theta.sin()-current_theta_rad.sin()); let dy=TURNING_RADIUS*(current_theta_rad.cos()-next_theta.cos()); next_x=current_x+dx; next_y=current_y+dy;}
-                Steering::Right=>{let a=param/num_steps as f64*gear_mult; next_theta=utils::normalize_angle_rad(current_theta_rad-a); let dx=TURNING_RADIUS*(current_theta_rad.sin()-next_theta.sin()); let dy=TURNING_RADIUS*(next_theta.cos()-current_theta_rad.cos()); next_x=current_x+dx; next_y=current_y+dy;}
+                Steering::Straight=>{let d=param/n_steps as f64*g_mult; nx=current_x+d*current_theta_rad.cos(); ny=current_y+d*current_theta_rad.sin(); nt=current_theta_rad;}
+                Steering::Left=>{let a=param/n_steps as f64*g_mult; nt=utils::normalize_angle_rad(current_theta_rad+a); let dx=TURNING_RADIUS*(nt.sin()-current_theta_rad.sin()); let dy=TURNING_RADIUS*(current_theta_rad.cos()-nt.cos()); nx=current_x+dx; ny=current_y+dy;}
+                Steering::Right=>{let a=param/n_steps as f64*g_mult; nt=utils::normalize_angle_rad(current_theta_rad-a); let dx=TURNING_RADIUS*(current_theta_rad.sin()-nt.sin()); let dy=TURNING_RADIUS*(nt.cos()-current_theta_rad.cos()); nx=current_x+dx; ny=current_y+dy;}
             };
-             current_x=next_x; current_y=next_y; current_theta_rad=next_theta;
+             current_x=nx; current_y=ny; current_theta_rad=nt;
              points.push(State::world_to_screen_static(current_x, current_y));
         }
     } points
@@ -278,52 +262,48 @@ fn draw_path_turning_circles(path: &Path, start_pose: &Pose) {
         let gear_mult = match element.gear { Gear::Forward => 1.0, Gear::Backwards => -1.0 };
         match element.steering {
             Steering::Straight => { let dist = element.param * gear_mult; current_x += dist * current_theta_rad.cos(); current_y += dist * current_theta_rad.sin(); }
-            Steering::Left => { let cx = current_x - TURNING_RADIUS * current_theta_rad.sin(); let cy = current_y + TURNING_RADIUS * current_theta_rad.cos(); let cs = State::world_to_screen_static(cx, cy); draw_circle_lines( cs.x, cs.y, turning_radius_screen, 1.0, TURNING_CIRCLE_COLOR, ); draw_circle( cs.x, cs.y, 2.0, TURNING_CIRCLE_COLOR ); let angle_change = element.param * gear_mult; let next_theta = utils::normalize_angle_rad(current_theta_rad + angle_change); current_x = cx + TURNING_RADIUS * next_theta.sin(); current_y = cy - TURNING_RADIUS * next_theta.cos(); current_theta_rad = next_theta; }
-            Steering::Right => { let cx = current_x + TURNING_RADIUS * current_theta_rad.sin(); let cy = current_y - TURNING_RADIUS * current_theta_rad.cos(); let cs = State::world_to_screen_static(cx, cy); draw_circle_lines( cs.x, cs.y, turning_radius_screen, 1.0, TURNING_CIRCLE_COLOR, ); draw_circle( cs.x, cs.y, 2.0, TURNING_CIRCLE_COLOR ); let angle_change = element.param * gear_mult; let next_theta = utils::normalize_angle_rad(current_theta_rad - angle_change); current_x = cx - TURNING_RADIUS * next_theta.sin(); current_y = cy + TURNING_RADIUS * next_theta.cos(); current_theta_rad = next_theta; }
+            Steering::Left => { let cx=current_x-TURNING_RADIUS*current_theta_rad.sin(); let cy=current_y+TURNING_RADIUS*current_theta_rad.cos(); let cs=State::world_to_screen_static(cx,cy); draw_circle_lines(cs.x,cs.y,turning_radius_screen,1.0,TURNING_CIRCLE_COLOR,); draw_circle(cs.x,cs.y,2.0,TURNING_CIRCLE_COLOR); let angle=element.param*gear_mult; let next_theta=utils::normalize_angle_rad(current_theta_rad+angle); current_x=cx+TURNING_RADIUS*next_theta.sin(); current_y=cy-TURNING_RADIUS*next_theta.cos(); current_theta_rad=next_theta; }
+            Steering::Right => { let cx=current_x+TURNING_RADIUS*current_theta_rad.sin(); let cy=current_y-TURNING_RADIUS*current_theta_rad.cos(); let cs=State::world_to_screen_static(cx,cy); draw_circle_lines(cs.x,cs.y,turning_radius_screen,1.0,TURNING_CIRCLE_COLOR,); draw_circle(cs.x,cs.y,2.0,TURNING_CIRCLE_COLOR); let angle=element.param*gear_mult; let next_theta=utils::normalize_angle_rad(current_theta_rad-angle); current_x=cx-TURNING_RADIUS*next_theta.sin(); current_y=cy+TURNING_RADIUS*next_theta.cos(); current_theta_rad=next_theta; }
         }
     }
 }
 
 // Draw UI text instructions and widgets
 fn draw_ui(state: &mut State) {
-    // Instructions Text
+    // Instructions Text / Coords / Pose Info / Path Info / Dragging Text / Angle Def Line
     let text = match state.app_state { AppState::PlacingStart=>"Click START pos",AppState::DefiningStartAngle=>"Drag/release START angle",AppState::PlacingEnd=>"Click END pos",AppState::DefiningEndAngle=>"Drag/release END angle",AppState::DisplayingPaths=>"Drag Body/H'light. Use UI. 'R' Reset.",}; draw_text(text, 20.0, 30.0, 24.0, WHITE);
-    // Coords Text
-    let mouse_pos_screen = mouse_position(); let (mouse_x_world, mouse_y_world) = state.screen_to_world(vec2(mouse_pos_screen.0, mouse_pos_screen.1)); let coord_text = format!("World: ({:.2}, {:.2})", mouse_x_world, mouse_y_world); draw_text(&coord_text, 20.0, 60.0, 20.0, LIGHTGRAY);
-    // Pose Info Text
+    let mouse_pos_screen=mouse_position(); let(mouse_x_world,mouse_y_world)=state.screen_to_world(vec2(mouse_pos_screen.0,mouse_pos_screen.1)); let coord_text=format!("World:({:.2},{:.2})",mouse_x_world,mouse_y_world); draw_text(&coord_text,20.0,60.0,20.0,LIGHTGRAY);
     if let Some(p)=state.start_pose{let t=format!("Start:({:.1},{:.1},{:.1}°)",p.x,p.y,p.theta_degree);draw_text(&t,20.0,WINDOW_HEIGHT as f32-60.0,18.0,START_CAR_COLOR);}
     if let Some(p)=state.end_pose{let t=format!("End:  ({:.1},{:.1},{:.1}°)",p.x,p.y,p.theta_degree);draw_text(&t,20.0,WINDOW_HEIGHT as f32-40.0,18.0,END_CAR_COLOR);}
-    // Path Info Text
-    if let Some(ref p)=state.current_raw_path{let t = match state.display_mode {DisplayMode::SinglePath(idx) => format!("P{} Len:{:.2}",idx+1,path_length(p)), DisplayMode::ShortestPath | DisplayMode::AllPaths => format!("Shortest Len:{:.2}", path_length(p)),};draw_text(&t,20.0,WINDOW_HEIGHT as f32-20.0,18.0,SELECTED_PATH_COLOR);}
-    // Dragging Text
+    if let Some(ref p)=state.current_raw_path{let t=match state.display_mode{DisplayMode::SinglePath(idx)=>format!("P{} Len:{:.2}",idx+1,path_length(p)),DisplayMode::ShortestPath|DisplayMode::AllPaths=>format!("Shortest Len:{:.2}",path_length(p)),};draw_text(&t,20.0,WINDOW_HEIGHT as f32-20.0,18.0,SELECTED_PATH_COLOR);}
     let drag_mode_text=match state.dragging_modify{Some(ModifyDragTarget::StartBody)=>"Mov Start",Some(ModifyDragTarget::StartAngle)=>"Rot Start",Some(ModifyDragTarget::EndBody)=>"Mov End",Some(ModifyDragTarget::EndAngle)=>"Rot End",None=>"",}; if!drag_mode_text.is_empty(){draw_text(drag_mode_text,20.0,90.0,20.0,YELLOW);}
-    // Angle Def Line/Text
     if let Some(drag)=&state.drag_state_initial{if state.app_state==AppState::DefiningStartAngle||state.app_state==AppState::DefiningEndAngle{draw_line(drag.start_pos.x,drag.start_pos.y,drag.current_pos.x,drag.current_pos.y,2.0,YELLOW); if let Some(angle)=state.calculate_initial_drag_angle(){let t=format!("{:.1}°",angle);draw_text(&t,drag.current_pos.x+10.0,drag.current_pos.y,20.0,YELLOW);}}}
 
     // --- Draw UI Widgets ---
     if state.app_state == AppState::DisplayingPaths {
-        let ui_width = 150.0; let ui_x = WINDOW_WIDTH as f32 - ui_width - 20.0;
+        // *** FIX: Increase UI Width ***
+        let ui_width = 200.0; // Make wider
+        let ui_x = WINDOW_WIDTH as f32 - ui_width - 20.0; // Adjust x position
         let ui_y = 20.0; let ui_height = 120.0;
+
         root_ui().window(hash!(), vec2(ui_x, ui_y), vec2(ui_width, ui_height), |ui| {
             ui.label(None, "Display Mode:");
-            // Generate labels dynamically each frame
             let mut mode_labels: Vec<String> = vec![ "Shortest Path".to_string(), "All Paths".to_string(), ];
             mode_labels.extend((1..=12).map(|i| format!("Path {}", i)));
             let mode_labels_str: Vec<&str> = mode_labels.iter().map(|s| s.as_str()).collect();
 
+            // This ComboBox should now hopefully render text correctly with more width
             widgets::ComboBox::new(hash!("display_mode_select"), &mode_labels_str)
                 .ui(ui, &mut state.combo_box_selected_index);
 
             ui.separator();
 
-            // Use if statement for disabling checkboxes
             let is_single_path_mode = matches!(state.display_mode, DisplayMode::SinglePath(_));
             if is_single_path_mode {
                  ui.checkbox(hash!("reflect_check"), "Reflect", &mut state.reflect_path);
                  ui.checkbox(hash!("timeflip_check"), "Timeflip", &mut state.timeflip_path);
             } else {
-                 // Draw disabled text labels instead of interactive checkboxes
-                 // You might need to adjust positioning/layout slightly if using labels
+                 // Draw disabled text labels
                  ui.label(None, "Reflect (N/A)");
                  ui.label(None, "Timeflip (N/A)");
             }
@@ -342,7 +322,11 @@ async fn main() {
         let old_reflect=state.reflect_path; let old_timeflip=state.timeflip_path;
         let mut needs_recalculation = false;
 
-        if is_key_pressed(KeyCode::R){state.reset();continue;}
+        // *** FIX: Remove 'continue' from reset logic ***
+        if is_key_pressed(KeyCode::R) {
+            state.reset();
+            // continue; // REMOVED
+        }
 
         // --- Input/State Logic ---
         match state.app_state {
@@ -350,31 +334,20 @@ async fn main() {
             AppState::DefiningStartAngle=>{if is_mouse_button_down(MouseButton::Left){if let Some(drag)=&mut state.drag_state_initial{drag.current_pos=mouse_screen;}if let Some(angle)=state.calculate_initial_drag_angle(){if let Some(start)=&mut state.start_pose{start.theta_degree=angle;}}}else if is_mouse_button_released(MouseButton::Left){if let Some(angle)=state.calculate_initial_drag_angle(){if let Some(start)=&mut state.start_pose{start.theta_degree=angle;}}state.drag_state_initial=None;state.app_state=AppState::PlacingEnd;}}
             AppState::PlacingEnd=>{if is_mouse_button_pressed(MouseButton::Left){state.end_pose=Some(Pose{x:world_x,y:world_y,theta_degree:0.0});state.drag_state_initial=Some(InitialDragState{start_pos:mouse_screen,current_pos:mouse_screen});state.app_state=AppState::DefiningEndAngle;}}
             AppState::DefiningEndAngle=>{if is_mouse_button_down(MouseButton::Left){if let Some(drag)=&mut state.drag_state_initial{drag.current_pos=mouse_screen;}if let Some(angle)=state.calculate_initial_drag_angle(){if let Some(end)=&mut state.end_pose{end.theta_degree=angle;}}}else if is_mouse_button_released(MouseButton::Left){if let Some(angle)=state.calculate_initial_drag_angle(){if let Some(end)=&mut state.end_pose{end.theta_degree=angle;}}state.drag_state_initial=None;state.calculate_display_data();state.app_state=AppState::DisplayingPaths;}}
-            AppState::DisplayingPaths=>{let ui_rect=Rect::new(WINDOW_WIDTH as f32-150.0-20.0,20.0,150.0,120.0);let mouse_over_ui=ui_rect.contains(mouse_screen);if is_mouse_button_pressed(MouseButton::Left)&&!mouse_over_ui{let mut tf=false;if let Some(p)=&state.start_pose{if state.check_headlight_hit((world_x,world_y),p){state.dragging_modify=Some(ModifyDragTarget::StartAngle);tf=true;}}if!tf{if let Some(p)=&state.end_pose{if state.check_headlight_hit((world_x,world_y),p){state.dragging_modify=Some(ModifyDragTarget::EndAngle);tf=true;}}}if!tf{if let Some(p)=&state.start_pose{if state.check_body_hit((world_x,world_y),p){state.dragging_modify=Some(ModifyDragTarget::StartBody);tf=true;}}}if!tf{if let Some(p)=&state.end_pose{if state.check_body_hit((world_x,world_y),p){state.dragging_modify=Some(ModifyDragTarget::EndBody);}}}}if let Some(target)=state.dragging_modify{if is_mouse_button_down(MouseButton::Left){match target{ModifyDragTarget::StartBody=>{if let Some(p)=&mut state.start_pose{p.x=world_x;p.y=world_y;needs_recalculation=true;}}ModifyDragTarget::EndBody=>{if let Some(p)=&mut state.end_pose{p.x=world_x;p.y=world_y;needs_recalculation=true;}}ModifyDragTarget::StartAngle=>{if let Some(p)=&mut state.start_pose{let dx=world_x-p.x;let dy=world_y-p.y;if dx.hypot(dy)>1e-6{p.theta_degree=dy.atan2(dx).to_degrees();needs_recalculation=true;}}}ModifyDragTarget::EndAngle=>{if let Some(p)=&mut state.end_pose{let dx=world_x-p.x;let dy=world_y-p.y;if dx.hypot(dy)>1e-6{p.theta_degree=dy.atan2(dx).to_degrees();needs_recalculation=true;}}}}}else if is_mouse_button_released(MouseButton::Left){state.dragging_modify=None;needs_recalculation=true;}}}
+            AppState::DisplayingPaths=>{let ui_rect=Rect::new(WINDOW_WIDTH as f32-200.0-20.0,20.0,200.0,120.0);/*Adjusted width*/let mouse_over_ui=ui_rect.contains(mouse_screen);if is_mouse_button_pressed(MouseButton::Left)&&!mouse_over_ui{let mut tf=false;if let Some(p)=&state.start_pose{if state.check_headlight_hit((world_x,world_y),p){state.dragging_modify=Some(ModifyDragTarget::StartAngle);tf=true;}}if!tf{if let Some(p)=&state.end_pose{if state.check_headlight_hit((world_x,world_y),p){state.dragging_modify=Some(ModifyDragTarget::EndAngle);tf=true;}}}if!tf{if let Some(p)=&state.start_pose{if state.check_body_hit((world_x,world_y),p){state.dragging_modify=Some(ModifyDragTarget::StartBody);tf=true;}}}if!tf{if let Some(p)=&state.end_pose{if state.check_body_hit((world_x,world_y),p){state.dragging_modify=Some(ModifyDragTarget::EndBody);}}}}if let Some(target)=state.dragging_modify{if is_mouse_button_down(MouseButton::Left){match target{ModifyDragTarget::StartBody=>{if let Some(p)=&mut state.start_pose{p.x=world_x;p.y=world_y;needs_recalculation=true;}}ModifyDragTarget::EndBody=>{if let Some(p)=&mut state.end_pose{p.x=world_x;p.y=world_y;needs_recalculation=true;}}ModifyDragTarget::StartAngle=>{if let Some(p)=&mut state.start_pose{let dx=world_x-p.x;let dy=world_y-p.y;if dx.hypot(dy)>1e-6{p.theta_degree=dy.atan2(dx).to_degrees();needs_recalculation=true;}}}ModifyDragTarget::EndAngle=>{if let Some(p)=&mut state.end_pose{let dx=world_x-p.x;let dy=world_y-p.y;if dx.hypot(dy)>1e-6{p.theta_degree=dy.atan2(dx).to_degrees();needs_recalculation=true;}}}}}else if is_mouse_button_released(MouseButton::Left){state.dragging_modify=None;needs_recalculation=true;}}}
         } // end match state.app_state
-
 
         // --- Drawing ---
         clear_background(BG_COLOR);
 
-        // Draw turning circles first (conditionally)
-        match state.display_mode {
-            DisplayMode::SinglePath(_) | DisplayMode::ShortestPath => {
-                // FIX: Remove 'ref'
-                if let (Some(path), Some(start)) = (&state.current_raw_path, &state.start_pose) {
-                     draw_path_turning_circles(path, start);
-                }
-            }
-            DisplayMode::AllPaths => { /* No circles */ }
+        match state.display_mode { // Draw circles conditionally
+            DisplayMode::SinglePath(_) | DisplayMode::ShortestPath => { if let (Some(path), Some(start)) = (&state.current_raw_path, &state.start_pose) { draw_path_turning_circles(path, start); } }
+            DisplayMode::AllPaths => {}
         }
-
         draw_paths(&state); // Draw path lines
-
         if let Some(ref pose)=state.start_pose{draw_pose_elements(pose,START_CAR_COLOR);}
         if let Some(ref pose)=state.end_pose{draw_pose_elements(pose,END_CAR_COLOR);}
-
-        // Draw UI last
-        draw_ui(&mut state);
+        draw_ui(&mut state); // Draw UI
 
         // --- Check for UI changes & Update Display Mode ---
         if state.app_state==AppState::DisplayingPaths {
