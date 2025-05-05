@@ -1,0 +1,8 @@
+[package]
+name = "visualize-reeds-shepp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reeds_shepp = { path = "/Users/linusweigand/Universitat/Master/1.Semester/Praktikum Motion Planning/reeds_shepp"}
+macroquad = "0.4.14"
