@@ -1,27 +1,42 @@
 use macroquad::prelude::*;
-use reeds_shepp_lib::{Gear, Path, PathElement, Pose, Steering, get_all_paths, get_optimal_path};
-use std::f64::consts::PI;
+// Import UI elements (built-in in macroquad 0.4+)
+use macroquad::ui::{hash, root_ui, widgets}; // Removed unused Ui
+
+// Import the modified library elements
+use reeds_shepp_lib::{
+    Gear,
+    PATH_FNS, // Array of path functions
+    Path,
+    Pose,
+    Steering,    // Basic types (Removed unused PathElement)
+    path_length, // Utility
+    reflect,
+    timeflip, // Transformation functions
+    utils,    // Access utils like change_of_basis if needed directly
+};
+// Removed unused PI
 
 const WINDOW_WIDTH: i32 = 1024;
 const WINDOW_HEIGHT: i32 = 768;
 const CAR_WIDTH: f32 = 30.0;
 const CAR_LENGTH: f32 = 50.0;
-const PATH_RESOLUTION: f64 = 20.0;
-const TURNING_RADIUS: f64 = 1.0;
+const PATH_RESOLUTION: f64 = 30.0; // Increased resolution for smoother curves
+const TURNING_RADIUS: f64 = 1.0; // Corresponds to radius=1 in the library functions
 const DRAW_SCALE: f32 = 50.0;
-const BODY_HIT_RADIUS_WORLD: f64 = (CAR_LENGTH / DRAW_SCALE / 2.0) as f64;
+// const BODY_HIT_RADIUS_WORLD: f64 = (CAR_LENGTH / DRAW_SCALE / 2.0) as f64; // Using rect check now
 const HEADLIGHT_SIZE_SCREEN: f32 = 8.0;
-const HEADLIGHT_HIT_RADIUS_WORLD: f64 = (HEADLIGHT_SIZE_SCREEN / DRAW_SCALE * 1.5) as f64;
-const BEAM_LENGTH: f32 = 60.0; // Length of headlight beam
-const BEAM_WIDTH: f32 = 40.0; // Width of headlight beam at the end
-const TURNING_CIRCLE_OPACITY: f32 = 0.2; // Opacity for turning radius circles
+// const HEADLIGHT_HIT_RADIUS_WORLD: f64 = (HEADLIGHT_SIZE_SCREEN / DRAW_SCALE * 1.5) as f64; // Using screen check now
+const BEAM_LENGTH: f32 = 60.0;
+const BEAM_WIDTH: f32 = 40.0;
+const TURNING_CIRCLE_OPACITY: f32 = 0.15; // Slightly more transparent
 
-// Colors matching the image
+// Colors
+const BG_COLOR: Color = Color::new(0.15, 0.15, 0.18, 1.0);
 const START_CAR_COLOR: Color = Color::new(0.7, 0.9, 0.7, 1.0); // Light green
 const END_CAR_COLOR: Color = Color::new(0.4, 0.5, 0.9, 1.0); // Blue
-const OPTIMAL_PATH_COLOR: Color = Color::new(1.0, 0.6, 0.1, 1.0); // Orange
+const SELECTED_PATH_COLOR: Color = Color::new(1.0, 0.6, 0.1, 1.0); // Orange for selected path
 const HEADLIGHT_COLOR: Color = Color::new(1.0, 1.0, 0.7, 1.0); // Light yellow
-const BEAM_COLOR: Color = Color::new(1.0, 1.0, 0.5, 0.5); // Yellow with transparency
+const BEAM_COLOR: Color = Color::new(1.0, 1.0, 0.5, 0.4); // Slightly less opaque beam
 const TURNING_CIRCLE_COLOR: Color = Color::new(0.8, 0.8, 0.8, TURNING_CIRCLE_OPACITY); // Light gray
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -53,25 +68,51 @@ struct State {
     end_pose: Option<Pose>,
     drag_state_initial: Option<InitialDragState>,
     dragging_modify: Option<ModifyDragTarget>,
-    all_paths_points: Vec<Vec<Vec2>>,
-    optimal_path_points: Option<Vec<Vec2>>,
+    // UI State
+    selected_path_index: usize, // Index 0-11 for path type
+    reflect_path: bool,
+    timeflip_path: bool,
+    // Store calculated path points for drawing
+    current_path_points: Option<Vec<Vec2>>,
+    // Store the raw path for potential info display
+    current_raw_path: Option<Path>,
+    // Cache labels for combobox
+    path_labels_str: Vec<&'static str>, // Need static lifetime for combo box options
+}
+
+// Function to create static string slices (leaking memory, but simple for this example)
+fn create_static_labels() -> Vec<&'static str> {
+    let mut labels = Vec::new();
+    for i in 1..=12 {
+        let s = Box::leak(format!("Path {}", i).into_boxed_str());
+        // Coerce to &'static str
+        labels.push(s as &'static str);
+    }
+    labels
 }
 
 impl State {
     fn new() -> Self {
+        let path_labels_str = create_static_labels();
         State {
             app_state: AppState::PlacingStart,
             start_pose: None,
             end_pose: None,
             drag_state_initial: None,
             dragging_modify: None,
-            all_paths_points: Vec::new(),
-            optimal_path_points: None,
+            selected_path_index: 0,
+            reflect_path: false,
+            timeflip_path: false,
+            current_path_points: None,
+            current_raw_path: None,
+            path_labels_str,
         }
     }
 
     fn reset(&mut self) {
+        let path_labels_str = self.path_labels_str.clone(); // Keep labels
         *self = State::new();
+        self.path_labels_str = path_labels_str; // Restore labels
         println!("State reset.");
     }
 
@@ -91,20 +132,27 @@ impl State {
 
     fn calculate_initial_drag_angle(&self) -> Option<f64> {
         if let Some(drag) = &self.drag_state_initial {
-            if (drag.current_pos - drag.start_pos).length_squared() > 10.0 * 10.0 {
-                let angle_rad_screen = (drag.current_pos.y - drag.start_pos.y)
-                    .atan2(drag.current_pos.x - drag.start_pos.x);
-                return Some((-angle_rad_screen).to_degrees().into());
+            let delta = drag.current_pos - drag.start_pos;
+            if delta.length_squared() > 5.0 * 5.0 {
+                let angle_rad_screen = delta.y.atan2(delta.x);
+                let angle_rad_world = -angle_rad_screen;
+                return Some(angle_rad_world.to_degrees() as f64);
             }
         }
         None
     }
 
     fn check_body_hit(&self, world_click_pos: (f64, f64), pose: &Pose) -> bool {
+        let angle_rad = pose.theta_degree.to_radians();
+        let cos_a = angle_rad.cos();
+        let sin_a = angle_rad.sin();
         let dx = world_click_pos.0 - pose.x;
         let dy = world_click_pos.1 - pose.y;
-        let dist_sq = dx * dx + dy * dy;
-        dist_sq < BODY_HIT_RADIUS_WORLD * BODY_HIT_RADIUS_WORLD
+        let local_x = dx * cos_a + dy * sin_a;
+        let local_y = -dx * sin_a + dy * cos_a;
+        let half_len_world = (CAR_LENGTH / DRAW_SCALE / 2.0) as f64;
+        let half_wid_world = (CAR_WIDTH / DRAW_SCALE / 2.0) as f64;
+        local_x.abs() <= half_len_world && local_y.abs() <= half_wid_world
     }
 
     fn get_headlight_world_pos(pose: &Pose) -> (f64, f64) {
@@ -121,165 +169,183 @@ impl State {
         let dx = world_click_pos.0 - headlight_x;
         let dy = world_click_pos.1 - headlight_y;
         let dist_sq = dx * dx + dy * dy;
-        dist_sq < HEADLIGHT_HIT_RADIUS_WORLD * HEADLIGHT_HIT_RADIUS_WORLD
+        let hit_radius_world = (HEADLIGHT_SIZE_SCREEN / DRAW_SCALE * 1.5) as f64;
+        dist_sq < hit_radius_world * hit_radius_world
     }
 
-    fn calculate_and_prepare_paths(&mut self) {
+    // Calculate the selected path based on UI state
+    fn calculate_selected_path(&mut self) {
+        self.current_path_points = None;
+        self.current_raw_path = None;
         if let (Some(start), Some(end)) = (self.start_pose, self.end_pose) {
-            let all_paths = get_all_paths(
-                Pose {
-                    x: start.x,
-                    y: start.y,
-                    theta_degree: start.theta_degree,
-                },
-                Pose {
-                    x: end.x,
-                    y: end.y,
-                    theta_degree: end.theta_degree,
-                },
-            );
-            let optimal_path_opt = get_optimal_path(
-                Pose {
-                    x: start.x,
-                    y: start.y,
-                    theta_degree: start.theta_degree,
-                },
-                Pose {
-                    x: end.x,
-                    y: end.y,
-                    theta_degree: end.theta_degree,
-                },
-            );
+            let relative_pose = utils::change_of_basis(&start, &end);
+            let mut x = relative_pose.x;
+            let mut y = relative_pose.y;
+            let mut theta_degree = relative_pose.theta_degree;
+            let needs_timeflip_calc = self.timeflip_path;
+            let needs_reflect_calc = self.reflect_path;
 
-            self.all_paths_points.clear();
-            for path in &all_paths {
-                let points = generate_path_points(&start, &end, path, PATH_RESOLUTION);
-                if !points.is_empty() {
-                    self.all_paths_points.push(points);
-                }
+            if needs_reflect_calc {
+                y = -y;
+                theta_degree = -theta_degree;
             }
-
-            self.optimal_path_points = None;
-            if let Some(optimal_path) = optimal_path_opt {
-                let optimal_points =
-                    generate_path_points(&start, &end, &optimal_path, PATH_RESOLUTION);
-                if !optimal_points.is_empty() {
-                    self.optimal_path_points = Some(optimal_points);
+            if needs_timeflip_calc {
+                x = -x;
+                theta_degree = if needs_reflect_calc {
+                    theta_degree
                 } else {
-                    println!("Warning: Optimal path found but generated no points.");
-                }
+                    -theta_degree
+                };
             }
-        } else {
-            self.all_paths_points.clear();
-            self.optimal_path_points = None;
+
+            let path_fn = PATH_FNS[self.selected_path_index];
+            let mut calculated_path = path_fn(x, y, theta_degree);
+
+            if needs_timeflip_calc {
+                calculated_path = timeflip(calculated_path);
+            }
+            if needs_reflect_calc {
+                calculated_path = reflect(calculated_path);
+            }
+
+            if !calculated_path.is_empty() {
+                let points = generate_path_points(&start, &end, &calculated_path, PATH_RESOLUTION);
+                if !points.is_empty() {
+                    self.current_path_points = Some(points);
+                    self.current_raw_path = Some(calculated_path);
+                    return;
+                } // else { println!("Warning: Path {} generated no points...", self.selected_path_index + 1); }
+            } // else { println!("Warning: Path {} calculation failed...", self.selected_path_index + 1); }
         }
     }
 }
 
-fn path_length(path: &Path) -> f64 {
-    path.iter().map(|e| e.param.abs()).sum()
-}
-
+// Generate points for drawing
 fn generate_path_points(
     start_pose: &Pose,
-    end_pose: &Pose,
+    _end_pose: &Pose,
     path: &Path,
     resolution: f64,
 ) -> Vec<Vec2> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+
     let mut points = Vec::new();
     let mut current_x = start_pose.x;
     let mut current_y = start_pose.y;
-    let mut current_theta_rad = start_pose.theta_degree.to_radians();
+    let mut current_theta_rad = utils::normalize_angle_rad(start_pose.theta_degree.to_radians());
 
     points.push(State::world_to_screen_static(current_x, current_y));
 
     for element in path {
         let param = element.param;
-        let num_steps = ((param.abs() * resolution).ceil().max(1.0)) as usize;
-        let step_size = if num_steps > 0 {
-            param / num_steps as f64
-        } else {
-            0.0
+        if param < 1e-10 {
+            continue;
+        }
+        let length_for_res = match element.steering {
+            Steering::Straight => param,
+            Steering::Left | Steering::Right => param.abs() * TURNING_RADIUS,
         };
-
+        let num_steps = ((length_for_res * resolution).ceil().max(1.0)) as usize;
         let gear_mult = match element.gear {
             Gear::Forward => 1.0,
             Gear::Backwards => -1.0,
         };
 
-        for _ in 0..num_steps {
-            let (dx, dy, dtheta) = match element.steering {
-                Steering::Straight => (
-                    step_size * gear_mult * current_theta_rad.cos(),
-                    step_size * gear_mult * current_theta_rad.sin(),
-                    0.0,
-                ),
+        let mut next_x;
+        let mut next_y;
+        let mut next_theta;
+
+        for _i in 1..=num_steps {
+            match element.steering {
+                Steering::Straight => {
+                    let dist_step = param / num_steps as f64 * gear_mult;
+                    next_x = current_x + dist_step * current_theta_rad.cos();
+                    next_y = current_y + dist_step * current_theta_rad.sin();
+                    next_theta = current_theta_rad;
+                }
                 Steering::Left => {
-                    let angle_step = step_size * gear_mult / TURNING_RADIUS;
-                    (
-                        TURNING_RADIUS * (current_theta_rad + angle_step).sin()
-                            - TURNING_RADIUS * current_theta_rad.sin(),
-                        TURNING_RADIUS * current_theta_rad.cos()
-                            - TURNING_RADIUS * (current_theta_rad + angle_step).cos(),
-                        angle_step,
-                    )
+                    let angle_step = param / num_steps as f64 * gear_mult;
+                    next_theta = utils::normalize_angle_rad(current_theta_rad + angle_step);
+                    let dx = TURNING_RADIUS * (next_theta.sin() - current_theta_rad.sin());
+                    let dy = TURNING_RADIUS * (current_theta_rad.cos() - next_theta.cos());
+                    next_x = current_x + dx;
+                    next_y = current_y + dy;
                 }
                 Steering::Right => {
-                    let angle_step = step_size * gear_mult / TURNING_RADIUS;
-                    (
-                        TURNING_RADIUS * current_theta_rad.sin()
-                            - TURNING_RADIUS * (current_theta_rad - angle_step).sin(),
-                        TURNING_RADIUS * (current_theta_rad - angle_step).cos()
-                            - TURNING_RADIUS * current_theta_rad.cos(),
-                        -angle_step,
-                    )
+                    let angle_step = param / num_steps as f64 * gear_mult;
+                    next_theta = utils::normalize_angle_rad(current_theta_rad - angle_step);
+                    let dx = TURNING_RADIUS * (current_theta_rad.sin() - next_theta.sin());
+                    let dy = TURNING_RADIUS * (next_theta.cos() - current_theta_rad.cos());
+                    next_x = current_x + dx;
+                    next_y = current_y + dy;
                 }
             };
-
-            current_x += dx;
-            current_y += dy;
-            current_theta_rad += dtheta;
-
+            current_x = next_x;
+            current_y = next_y;
+            current_theta_rad = next_theta;
             points.push(State::world_to_screen_static(current_x, current_y));
         }
     }
     points
 }
 
-// Draw car with headlight beam to match the image
+// Draw car, beams, turning circles
 fn draw_pose_elements(pose: &Pose, body_color: Color) {
     let center_screen = State::world_to_screen_static(pose.x, pose.y);
     let rotation_rad_world = pose.theta_degree.to_radians();
     let rotation_rad_screen = -rotation_rad_world as f32;
 
-    // Draw headlight beam first (behind car)
+    let left_turn_center_world_x = pose.x - TURNING_RADIUS * rotation_rad_world.sin();
+    let left_turn_center_world_y = pose.y + TURNING_RADIUS * rotation_rad_world.cos();
+    let right_turn_center_world_x = pose.x + TURNING_RADIUS * rotation_rad_world.sin();
+    let right_turn_center_world_y = pose.y - TURNING_RADIUS * rotation_rad_world.cos();
+    let left_turn_center_screen =
+        State::world_to_screen_static(left_turn_center_world_x, left_turn_center_world_y);
+    let right_turn_center_screen =
+        State::world_to_screen_static(right_turn_center_world_x, right_turn_center_world_y);
+    let turning_radius_screen = TURNING_RADIUS as f32 * DRAW_SCALE;
+    draw_circle_lines(
+        left_turn_center_screen.x,
+        left_turn_center_screen.y,
+        turning_radius_screen,
+        1.0,
+        TURNING_CIRCLE_COLOR,
+    );
+    draw_circle(
+        left_turn_center_screen.x,
+        left_turn_center_screen.y,
+        2.0,
+        TURNING_CIRCLE_COLOR,
+    );
+    draw_circle_lines(
+        right_turn_center_screen.x,
+        right_turn_center_screen.y,
+        turning_radius_screen,
+        1.0,
+        TURNING_CIRCLE_COLOR,
+    );
+    draw_circle(
+        right_turn_center_screen.x,
+        right_turn_center_screen.y,
+        2.0,
+        TURNING_CIRCLE_COLOR,
+    );
+
     let (headlight_x_world, headlight_y_world) = State::get_headlight_world_pos(pose);
     let headlight_screen = State::world_to_screen_static(headlight_x_world, headlight_y_world);
-
-    // Calculate beam vertices (trapezoid shape)
-    let beam_direction = Vec2::new(
-        rotation_rad_world.cos() as f32,
-        -rotation_rad_world.sin() as f32,
-    )
-    .normalize();
-
-    let beam_normal = Vec2::new(-beam_direction.y, beam_direction.x);
-
-    // Start position (at headlight)
+    let beam_direction = Vec2::from_angle(rotation_rad_screen).normalize();
+    let beam_normal = vec2(-beam_direction.y, beam_direction.x);
     let beam_start1 = headlight_screen + beam_normal * (HEADLIGHT_SIZE_SCREEN * 0.5);
     let beam_start2 = headlight_screen - beam_normal * (HEADLIGHT_SIZE_SCREEN * 0.5);
-
-    // End position (wider)
     let beam_end1 =
         headlight_screen + beam_direction * BEAM_LENGTH + beam_normal * (BEAM_WIDTH * 0.5);
     let beam_end2 =
         headlight_screen + beam_direction * BEAM_LENGTH - beam_normal * (BEAM_WIDTH * 0.5);
-
-    // Draw beam as polygon
     draw_triangle(beam_start1, beam_end1, beam_end2, BEAM_COLOR);
     draw_triangle(beam_start1, beam_end2, beam_start2, BEAM_COLOR);
 
-    // Draw body
     draw_rectangle_ex(
         center_screen.x,
         center_screen.y,
@@ -293,38 +359,12 @@ fn draw_pose_elements(pose: &Pose, body_color: Color) {
         },
     );
 
-    // Draw turning radius circle (behind the car)
-    let turning_center_world_x = pose.x - TURNING_RADIUS * rotation_rad_world.sin() as f64;
-    let turning_center_world_y = pose.y + TURNING_RADIUS * rotation_rad_world.cos() as f64;
-    let turning_center_screen =
-        State::world_to_screen_static(turning_center_world_x, turning_center_world_y);
-    let turning_radius_screen = TURNING_RADIUS as f32 * DRAW_SCALE;
-
-    draw_circle_lines(
-        turning_center_screen.x,
-        turning_center_screen.y,
-        turning_radius_screen,
-        1.0,
-        TURNING_CIRCLE_COLOR,
-    );
-
-    // Draw a small dot at the turning center
-    draw_circle(
-        turning_center_screen.x,
-        turning_center_screen.y,
-        2.0,
-        TURNING_CIRCLE_COLOR,
-    );
-
-    // Draw headlight (red circle with yellow inner circle as in the image)
     draw_circle(
         headlight_screen.x,
         headlight_screen.y,
         HEADLIGHT_SIZE_SCREEN,
         RED,
     );
-
-    // Inner headlight circle
     draw_circle(
         headlight_screen.x,
         headlight_screen.y,
@@ -333,71 +373,67 @@ fn draw_pose_elements(pose: &Pose, body_color: Color) {
     );
 }
 
-// Draw the calculated paths
+// Draw the calculated selected path
 fn draw_paths(state: &State) {
-    // Draw all paths (thin, semi-transparent light gray as in the image)
-    for path_points in &state.all_paths_points {
-        if path_points.len() > 1 {
-            for i in 0..(path_points.len() - 1) {
+    if let Some(points) = &state.current_path_points {
+        if points.len() > 1 {
+            for i in 0..(points.len() - 1) {
                 draw_line(
-                    path_points[i].x,
-                    path_points[i].y,
-                    path_points[i + 1].x,
-                    path_points[i + 1].y,
-                    1.0,
-                    Color::new(0.8, 0.8, 0.8, 0.4),
-                );
-            }
-        }
-    }
-
-    // Draw optimal path (thicker orange as in the image)
-    if let Some(optimal_points) = &state.optimal_path_points {
-        if optimal_points.len() > 1 {
-            for i in 0..(optimal_points.len() - 1) {
-                draw_line(
-                    optimal_points[i].x,
-                    optimal_points[i].y,
-                    optimal_points[i + 1].x,
-                    optimal_points[i + 1].y,
+                    points[i].x,
+                    points[i].y,
+                    points[i + 1].x,
+                    points[i + 1].y,
                     3.0,
-                    OPTIMAL_PATH_COLOR,
+                    SELECTED_PATH_COLOR,
                 );
             }
         }
     }
 }
 
-// Draw UI text instructions based on AppState
-fn draw_ui(state: &State) {
+// Draw UI text instructions and widgets
+fn draw_ui(state: &mut State) {
     let text = match state.app_state {
-        AppState::PlacingStart => "Click to place START position",
-        AppState::DefiningStartAngle => "Drag and release to set START angle",
+        /* ... */ AppState::PlacingStart => "Click to place START position",
+        AppState::DefiningStartAngle => "Drag/release START angle",
         AppState::PlacingEnd => "Click to place END position",
-        AppState::DefiningEndAngle => "Drag and release to set END angle",
-        AppState::DisplayingPaths => "Drag Body (Move) or Headlight (Rotate). Press 'R' to Reset.",
+        AppState::DefiningEndAngle => "Drag/release END angle",
+        AppState::DisplayingPaths => "Drag Body/Headlight. Use UI. 'R' Reset.",
     };
     draw_text(text, 20.0, 30.0, 24.0, WHITE);
-
     let mouse_pos_screen = mouse_position();
     let (mouse_x_world, mouse_y_world) =
         state.screen_to_world(vec2(mouse_pos_screen.0, mouse_pos_screen.1));
-    let coord_text = format!("World Coords: ({:.2}, {:.2})", mouse_x_world, mouse_y_world);
+    let coord_text = format!("World: ({:.2}, {:.2})", mouse_x_world, mouse_y_world);
     draw_text(&coord_text, 20.0, 60.0, 20.0, LIGHTGRAY);
-
-    // Indicate modification drag mode if active
+    if let Some(p) = state.start_pose {
+        let t = format!("Start: ({:.1}, {:.1}, {:.1}°)", p.x, p.y, p.theta_degree);
+        draw_text(&t, 20.0, WINDOW_HEIGHT as f32 - 60.0, 18.0, START_CAR_COLOR);
+    }
+    if let Some(p) = state.end_pose {
+        let t = format!("End:   ({:.1}, {:.1}, {:.1}°)", p.x, p.y, p.theta_degree);
+        draw_text(&t, 20.0, WINDOW_HEIGHT as f32 - 40.0, 18.0, END_CAR_COLOR);
+    }
+    if let Some(ref p) = state.current_raw_path {
+        let t = format!("Path Len: {:.2}", path_length(p));
+        draw_text(
+            &t,
+            20.0,
+            WINDOW_HEIGHT as f32 - 20.0,
+            18.0,
+            SELECTED_PATH_COLOR,
+        );
+    }
     let drag_mode_text = match state.dragging_modify {
         Some(ModifyDragTarget::StartBody) => "Moving Start",
-        Some(ModifyDragTarget::StartAngle) => "Rotating Start",
+        Some(ModifyDragTarget::StartAngle) => "Rot Start",
         Some(ModifyDragTarget::EndBody) => "Moving End",
-        Some(ModifyDragTarget::EndAngle) => "Rotating End",
+        Some(ModifyDragTarget::EndAngle) => "Rot End",
         None => "",
     };
     if !drag_mode_text.is_empty() {
         draw_text(drag_mode_text, 20.0, 90.0, 20.0, YELLOW);
     }
-
-    // Draw the initial angle definition line if active
     if let Some(drag) = &state.drag_state_initial {
         if state.app_state == AppState::DefiningStartAngle
             || state.app_state == AppState::DefiningEndAngle
@@ -410,13 +446,45 @@ fn draw_ui(state: &State) {
                 2.0,
                 YELLOW,
             );
+            if let Some(angle) = state.calculate_initial_drag_angle() {
+                let t = format!("{:.1}°", angle);
+                draw_text(
+                    &t,
+                    drag.current_pos.x + 10.0,
+                    drag.current_pos.y,
+                    20.0,
+                    YELLOW,
+                );
+            }
         }
+    }
+
+    // --- Draw UI Widgets ---
+    if state.app_state == AppState::DisplayingPaths {
+        let ui_width = 150.0;
+        let ui_x = WINDOW_WIDTH as f32 - ui_width - 20.0;
+        let ui_y = 20.0;
+        let ui_height = 110.0;
+        root_ui().window(hash!(), vec2(ui_x, ui_y), vec2(ui_width, ui_height), |ui| {
+            ui.label(None, "Select Path:");
+            // Pass options directly to new(), pass &mut index to ui()
+            widgets::ComboBox::new(hash!("path_select"), &state.path_labels_str)
+                .ui(ui, &mut state.selected_path_index); // Pass mutable reference HERE
+
+            ui.separator();
+            ui.checkbox(hash!("reflect_check"), "Reflect", &mut state.reflect_path);
+            ui.checkbox(
+                hash!("timeflip_check"),
+                "Timeflip",
+                &mut state.timeflip_path,
+            );
+        });
     }
 }
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "Reeds-Shepp Path Visualizer - Place & Modify".to_owned(),
+        window_title: "Reeds-Shepp Path Visualizer".to_owned(),
         window_width: WINDOW_WIDTH,
         window_height: WINDOW_HEIGHT,
         ..Default::default()
@@ -426,17 +494,18 @@ fn window_conf() -> Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     let mut state = State::new();
-
     loop {
         let mouse_screen = vec2(mouse_position().0, mouse_position().1);
         let (world_x, world_y) = state.screen_to_world(mouse_screen);
-
-        // Global reset key
+        let old_selected_index = state.selected_path_index;
+        let old_reflect = state.reflect_path;
+        let old_timeflip = state.timeflip_path;
+        let mut needs_recalculation = false;
         if is_key_pressed(KeyCode::R) {
             state.reset();
+            continue;
         }
 
-        // --- Input Handling based on AppState ---
         match state.app_state {
             AppState::PlacingStart => {
                 if is_mouse_button_pressed(MouseButton::Left) {
@@ -450,22 +519,23 @@ async fn main() {
                         current_pos: mouse_screen,
                     });
                     state.app_state = AppState::DefiningStartAngle;
-                    println!("Start pos set. Define angle.");
                 }
             }
             AppState::DefiningStartAngle => {
                 if is_mouse_button_down(MouseButton::Left) {
                     if let Some(drag) = &mut state.drag_state_initial {
                         drag.current_pos = mouse_screen;
-                        if let Some(angle_deg) = state.calculate_initial_drag_angle() {
-                            if let Some(start) = &mut state.start_pose {
-                                start.theta_degree = angle_deg;
-                            }
+                    }
+                    if let Some(angle) = state.calculate_initial_drag_angle() {
+                        if let Some(start) = &mut state.start_pose {
+                            start.theta_degree = angle;
                         }
                     }
                 } else if is_mouse_button_released(MouseButton::Left) {
-                    if let Some(start) = &state.start_pose {
-                        println!("Start angle set to: {:.1}°", start.theta_degree);
+                    if let Some(angle) = state.calculate_initial_drag_angle() {
+                        if let Some(start) = &mut state.start_pose {
+                            start.theta_degree = angle;
+                        }
                     }
                     state.drag_state_initial = None;
                     state.app_state = AppState::PlacingEnd;
@@ -483,37 +553,38 @@ async fn main() {
                         current_pos: mouse_screen,
                     });
                     state.app_state = AppState::DefiningEndAngle;
-                    println!("End pos set. Define angle.");
                 }
             }
             AppState::DefiningEndAngle => {
                 if is_mouse_button_down(MouseButton::Left) {
                     if let Some(drag) = &mut state.drag_state_initial {
                         drag.current_pos = mouse_screen;
-                        if let Some(angle_deg) = state.calculate_initial_drag_angle() {
-                            if let Some(end) = &mut state.end_pose {
-                                end.theta_degree = angle_deg;
-                            }
+                    }
+                    if let Some(angle) = state.calculate_initial_drag_angle() {
+                        if let Some(end) = &mut state.end_pose {
+                            end.theta_degree = angle;
                         }
                     }
                 } else if is_mouse_button_released(MouseButton::Left) {
-                    if let Some(end) = &state.end_pose {
-                        println!("End angle set to: {:.1}°", end.theta_degree);
+                    if let Some(angle) = state.calculate_initial_drag_angle() {
+                        if let Some(end) = &mut state.end_pose {
+                            end.theta_degree = angle;
+                        }
                     }
                     state.drag_state_initial = None;
-                    state.calculate_and_prepare_paths();
+                    state.calculate_selected_path();
                     state.app_state = AppState::DisplayingPaths;
-                    println!("Poses defined. Displaying paths. Drag to modify.");
                 }
             }
             AppState::DisplayingPaths => {
-                if is_mouse_button_pressed(MouseButton::Left) {
+                let ui_rect = Rect::new(WINDOW_WIDTH as f32 - 150.0 - 20.0, 20.0, 150.0, 110.0);
+                let mouse_over_ui = ui_rect.contains(mouse_screen);
+                if is_mouse_button_pressed(MouseButton::Left) && !mouse_over_ui {
                     let mut target_found = false;
                     if let Some(ref pose) = state.start_pose {
                         if state.check_headlight_hit((world_x, world_y), pose) {
                             state.dragging_modify = Some(ModifyDragTarget::StartAngle);
                             target_found = true;
-                            println!("Dragging Start Angle");
                         }
                     }
                     if !target_found {
@@ -521,7 +592,6 @@ async fn main() {
                             if state.check_headlight_hit((world_x, world_y), pose) {
                                 state.dragging_modify = Some(ModifyDragTarget::EndAngle);
                                 target_found = true;
-                                println!("Dragging End Angle");
                             }
                         }
                     }
@@ -530,7 +600,6 @@ async fn main() {
                             if state.check_body_hit((world_x, world_y), pose) {
                                 state.dragging_modify = Some(ModifyDragTarget::StartBody);
                                 target_found = true;
-                                println!("Dragging Start Body");
                             }
                         }
                     }
@@ -538,12 +607,10 @@ async fn main() {
                         if let Some(ref pose) = state.end_pose {
                             if state.check_body_hit((world_x, world_y), pose) {
                                 state.dragging_modify = Some(ModifyDragTarget::EndBody);
-                                println!("Dragging End Body");
                             }
                         }
                     }
                 }
-
                 if let Some(target) = state.dragging_modify {
                     if is_mouse_button_down(MouseButton::Left) {
                         match target {
@@ -551,12 +618,14 @@ async fn main() {
                                 if let Some(pose) = &mut state.start_pose {
                                     pose.x = world_x;
                                     pose.y = world_y;
+                                    needs_recalculation = true;
                                 }
                             }
                             ModifyDragTarget::EndBody => {
                                 if let Some(pose) = &mut state.end_pose {
                                     pose.x = world_x;
                                     pose.y = world_y;
+                                    needs_recalculation = true;
                                 }
                             }
                             ModifyDragTarget::StartAngle => {
@@ -565,6 +634,7 @@ async fn main() {
                                     let dy = world_y - pose.y;
                                     if dx.hypot(dy) > 1e-6 {
                                         pose.theta_degree = dy.atan2(dx).to_degrees();
+                                        needs_recalculation = true;
                                     }
                                 }
                             }
@@ -574,37 +644,41 @@ async fn main() {
                                     let dy = world_y - pose.y;
                                     if dx.hypot(dy) > 1e-6 {
                                         pose.theta_degree = dy.atan2(dx).to_degrees();
+                                        needs_recalculation = true;
                                     }
                                 }
                             }
                         }
-                        state.calculate_and_prepare_paths();
                     } else if is_mouse_button_released(MouseButton::Left) {
-                        println!("Modification finished.");
                         state.dragging_modify = None;
+                        needs_recalculation = true;
                     }
                 }
             }
         }
 
-        // --- Drawing ---
-        clear_background(Color::new(0.2, 0.2, 0.2, 1.0)); // Darker background like in the image
-
-        // Draw turning circles and paths first
+        clear_background(BG_COLOR);
         draw_paths(&state);
-
-        // Draw car representations
         if let Some(ref pose) = state.start_pose {
             draw_pose_elements(pose, START_CAR_COLOR);
         }
         if let Some(ref pose) = state.end_pose {
             draw_pose_elements(pose, END_CAR_COLOR);
         }
+        draw_ui(&mut state); // Draw UI potentially modifies state via &mut state passed in
 
-        // Draw UI elements
-        draw_ui(&state);
+        if state.app_state == AppState::DisplayingPaths {
+            if state.selected_path_index != old_selected_index
+                || state.reflect_path != old_reflect
+                || state.timeflip_path != old_timeflip
+            {
+                needs_recalculation = true;
+            }
+        }
+        if needs_recalculation {
+            state.calculate_selected_path();
+        }
 
         next_frame().await
     }
 }
-
